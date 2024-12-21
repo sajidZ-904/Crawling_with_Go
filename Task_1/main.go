@@ -1,71 +1,141 @@
 package main
 
 import (
-    "fmt"
-    "log"
+	"context"
+	"fmt"
+	"log"
+	"regexp"
+	"strings"
 
-    "github.com/nguyenthenguyen/docx"
-    "go.mongodb.org/mongo-driver/bson"
-    "go.mongodb.org/mongo-driver/mongo"
-    "go.mongodb.org/mongo-driver/mongo/options"
-    "context"
+	"github.com/ledongthuc/pdf"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// Define a struct to hold extracted data
-type ExtractedData struct {
-    Questions []string `bson:"questions"`
-    Images    []string `bson:"images"`
-    Equations []string `bson:"equations"`
+func extractTextFromPDF(filePath string) (string, error) {
+	f, r, err := pdf.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	var textBuilder strings.Builder
+	for i := 1; i <= r.NumPage(); i++ {
+		page := r.Page(i)
+		text, err := page.GetPlainText(nil)
+		if err != nil {
+			return "", err
+		}
+		textBuilder.WriteString(text)
+		textBuilder.WriteString("\n")
+	}
+
+	return textBuilder.String(), nil
 }
 
-// Function to extract data from a .docx file
-func extractFromDocx(filePath string) (*ExtractedData, error) {
-    r, err := docx.ReadDocxFile(filePath)
-    if err != nil {
-        return nil, err
-    }
-    defer r.Close()
+func parseQuestionBlock(block string) (bson.M, bool) {
+	lines := strings.Split(block, "\n")
+	var question string
+	var options []string
+	var answer, reference, concept string
 
-    doc := r.Editable()
-    text := doc.GetContent()
-    
-    // Dummy extraction logic
-    questions := []string{"Question 1?", "Question 2?"}
-    images := []string{"image1.png", "image2.png"}
-    equations := []string{"E = mc^2", "a^2 + b^2 = c^2"}
+	optionRegex := regexp.MustCompile(`\(\w+\)\s+.+`) // Matches options like "(a) Option text"
+	answerRegex := regexp.MustCompile(`উত্তর:\s*(\([a-d]\))`)
+	referenceRegex := regexp.MustCompile(`রেফারেন্স:|ররফাররন্স:`)
+	conceptRegex := regexp.MustCompile(`কনসেপ্ট:|কনরেপ্ট:`)
 
-    return &ExtractedData{
-        Questions: questions,
-        Images:    images,
-        Equations: equations,
-    }, nil
-}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
 
-// MongoDB connection and data insertion
-func insertDataToMongo(data *ExtractedData) error {
-    clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
-    client, err := mongo.Connect(context.TODO(), clientOptions)
-    if err != nil {
-        return err
-    }
-    defer client.Disconnect(context.TODO())
+		switch {
+		case answerRegex.MatchString(line):
+			answerMatches := answerRegex.FindStringSubmatch(line)
+			if len(answerMatches) > 1 {
+				answer = answerMatches[1]
+			}
+		case referenceRegex.MatchString(line):
+			reference = strings.TrimSpace(referenceRegex.Split(line, 2)[1])
+		case conceptRegex.MatchString(line):
+			concept = strings.TrimSpace(conceptRegex.Split(line, 2)[1])
+		case optionRegex.MatchString(line):
+			options = append(options, line)
+		default:
+			question += line + " "
+		}
+	}
 
-    collection := client.Database("documents").Collection("collections")
-    _, err = collection.InsertOne(context.TODO(), data)
-    return err
+	question = strings.TrimSpace(question)
+	if question == "" && len(options) == 0 && answer == "" {
+		fmt.Printf("Skipped Block: %s\n", block)
+		return nil, false
+	}
+
+	// Ensure options have a minimum of 4 entries
+	for len(options) < 4 {
+		options = append(options, fmt.Sprintf("(%c) N/A", 'a'+len(options)))
+	}
+
+	return bson.M{
+		"_id":        primitive.NewObjectID(),
+		"question":   question,
+		"options":    options,
+		"answer":     answer,
+		"references": reference,
+		"concepts":   concept,
+	}, true
 }
 
 func main() {
-    // Example usage
-    data, err := extractFromDocx("word_files/c.docx")
-    if err != nil {
-        log.Fatalf("Failed to extract data: %v", err)
-    }
+	filePath := "files/a.pdf"
 
-    err = insertDataToMongo(data)
-    if err != nil {
-        log.Fatalf("Failed to insert data to MongoDB: %v", err)
-    }
+	// Extract text from the PDF
+	text, err := extractTextFromPDF(filePath)
+	if err != nil {
+		log.Fatalf("Failed to extract text from PDF: %v", err)
+	}
 
-    fmt.Println("Data successfully extracted and stored.")
+	// Split text into question blocks using regex
+	blockRegex := regexp.MustCompile(`\d{1,3}\.`)
+	blocks := blockRegex.Split(text, -1)
+
+	var bsonData []interface{}
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+
+		parsedData, valid := parseQuestionBlock(block)
+		if valid {
+			bsonData = append(bsonData, parsedData)
+		}
+		if len(bsonData) == 100 { // Limit to 100 questions
+			break
+		}
+	}
+
+	// Insert data into MongoDB
+	if len(bsonData) == 0 {
+		log.Fatalf("No valid data to insert.")
+	}
+
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		log.Fatalf("Failed to connect to MongoDB: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	collection := client.Database("documents").Collection("questions")
+	_, err = collection.InsertMany(context.Background(), bsonData)
+	if err != nil {
+		log.Fatalf("Failed to insert data: %v", err)
+	}
+
+	fmt.Println("Questions inserted successfully.")
 }
